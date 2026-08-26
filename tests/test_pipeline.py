@@ -16,10 +16,21 @@ TRAIN_RATIO = 0.8
 
 
 class DummyModel:
-    """Stands in for SentenceTransformer so tests need no torch download."""
+    """Stands in for SentenceTransformer so tests need no torch download.
+
+    Vectors are a function of the text (first dim = text length) so tests
+    can verify that the deduplicated encoding assigns each row the vector
+    of its own text.
+    """
 
     def encode(self, texts, **kwargs):
-        return np.full((len(texts), EMBED_DIM), 0.5, dtype=np.float32)
+        vecs = np.full((len(texts), EMBED_DIM), 0.5, dtype=np.float32)
+        vecs[:, 0] = [len(t) for t in texts]
+        return vecs
+
+
+def _patch_model(mp: pytest.MonkeyPatch) -> None:
+    mp.setattr("fdata.cli.load_model", lambda backend: DummyModel())
 
 
 @pytest.fixture(scope="session")
@@ -32,7 +43,7 @@ def generated(fixture_paths, tmp_path_factory) -> Path:
     csv_path, _ = fixture_paths
     out = tmp_path_factory.mktemp("out") / "fdata.parquet"
     mp = pytest.MonkeyPatch()
-    mp.setattr("fdata.embedding.load_model", lambda: DummyModel())
+    _patch_model(mp)
     try:
         cli.main(
             [
@@ -107,6 +118,22 @@ def test_derived_features(df):
     assert df.filter(pl.col("ec") != 0)["exit state"].unique().to_list() == ["failed"]
 
 
+def test_deduplicated_embeddings(df):
+    # Every row's vector must be the one for its own text: first dim equals
+    # the length of the comma-joined original (usr, jnam, jobenv_req), which
+    # is constant within an anonymized triple. Rows sharing a triple share
+    # an identical vector; different text lengths give different vectors.
+    firsts = df.select(
+        pl.col("embedding").list.first().alias("e0"), "usr", "jnam", "jobenv_req"
+    )
+    per_triple = firsts.group_by("usr", "jnam", "jobenv_req").agg(
+        pl.col("e0").n_unique()
+    )
+    assert per_triple["e0"].max() == 1
+    assert firsts["e0"].n_unique() > 1
+    assert firsts["e0"].min() > 0  # the null-usr row still embeds jnam+env
+
+
 def test_final_columns_match_docs():
     docs = pl.read_csv(Path(__file__).parent.parent / "docs" / "feature_list.csv")
     assert FINAL_COLUMNS == docs["Column"].to_list()
@@ -116,7 +143,7 @@ def test_parquet_input(fixture_paths, tmp_path):
     _, parquet_path = fixture_paths
     out = tmp_path / "fdata_from_parquet.parquet"
     mp = pytest.MonkeyPatch()
-    mp.setattr("fdata.embedding.load_model", lambda: DummyModel())
+    _patch_model(mp)
     try:
         cli.main(["generate", "--input", str(parquet_path), "--output", str(out)])
     finally:

@@ -1,65 +1,109 @@
-"""Phase 2: batched Sentence-BERT embeddings streamed into the final parquet.
+"""Phase 3/4: deduplicated Sentence-BERT encoding and the final batched write.
 
-Model inference cannot be expressed lazily, so the phase-1 parquet is read
-back in bounded record batches; memory use is the model (~90 MB) plus one
-batch, independent of dataset size.
+The embedding input text is a function of (usr, jnam, jobenv_req) only, so
+the number of distinct texts is typically orders of magnitude smaller than
+the row count. Each distinct text is encoded exactly once (identical rows
+therefore get bit-identical vectors) and the final pass is a cheap join,
+streamed batch by batch with progress logged to stderr. Memory use is the
+model plus the distinct-text embedding table (~1.5 KB per distinct text),
+independent of the row count.
 """
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import polars as pl
 import pyarrow.parquet as pq
 
+from .anonymize import anonymize
 from .schema import EMBED_DIM, EMBED_MODEL, EMBED_TEXT_COL, OUTPUT_COLUMNS
+from .split import with_split
 
 
-def load_model():
+def load_model(backend: str = "torch"):
     from sentence_transformers import SentenceTransformer
 
-    return SentenceTransformer(EMBED_MODEL, device="cpu")
+    return SentenceTransformer(EMBED_MODEL, device="cpu", backend=backend)
 
 
-def add_embeddings(
+def encode_unique(
+    texts: list[str],
+    model,
+    chunk_size: int = 8192,
+    encode_batch_size: int = 256,
+    log=lambda msg: None,
+) -> pl.DataFrame:
+    """Encode each distinct text once; returns a {text -> embedding} table."""
+    total = len(texts)
+    t0 = time.monotonic()
+    chunks = []
+    for start in range(0, total, chunk_size):
+        chunk = texts[start : start + chunk_size]
+        vecs = model.encode(
+            chunk,
+            batch_size=encode_batch_size,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+        ).astype("float32")
+        chunks.append(
+            pl.DataFrame(
+                {
+                    EMBED_TEXT_COL: pl.Series(chunk, dtype=pl.Utf8),
+                    # list<float> (not fixed_size_list) to match the
+                    # published files
+                    "embedding": pl.Series(
+                        vecs, dtype=pl.Array(pl.Float32, EMBED_DIM)
+                    ).cast(pl.List(pl.Float32)),
+                }
+            )
+        )
+        done = min(start + chunk_size, total)
+        log(f"  encoded {done}/{total} unique texts ({time.monotonic() - t0:.1f}s)")
+    return pl.concat(chunks)
+
+
+def write_final(
     intermediate: Path,
     output: Path,
+    maps: dict[str, pl.DataFrame],
+    threshold: str | None,
+    embeddings: pl.DataFrame,
     batch_size: int = 8192,
-    model=None,
-    encode_batch_size: int = 256,
+    log=lambda msg: None,
 ) -> int:
-    """Read the phase-1 parquet, append embeddings batch by batch, write the
-    final single parquet in the public column order. Returns the row count."""
-    if model is None:
-        model = load_model()
-
+    """Stream the intermediate parquet, apply anonymization, split, and the
+    embedding lookup per batch, and write the final single parquet. Returns
+    the row count."""
+    emb_lazy = embeddings.lazy()
+    t0 = time.monotonic()
+    log_every = max(1, 1_000_000 // batch_size)
     rows = 0
+    batches = 0
     writer = None
     try:
         pf = pq.ParquetFile(intermediate)
         for batch in pf.iter_batches(batch_size=batch_size):
-            df = pl.from_arrow(batch)
-            texts = df[EMBED_TEXT_COL].fill_null("").to_list()
-            vecs = model.encode(
-                texts,
-                batch_size=encode_batch_size,
-                convert_to_numpy=True,
-                show_progress_bar=False,
-            ).astype("float32")
-            # list<float> (not fixed_size_list) to match the published files
-            embedding = pl.Series(
-                "embedding", vecs, dtype=pl.Array(pl.Float32, EMBED_DIM)
-            ).cast(pl.List(pl.Float32))
+            lf = (
+                pl.from_arrow(batch)
+                .lazy()
+                .with_columns(pl.col(EMBED_TEXT_COL).fill_null(""))
+            )
+            lf = with_split(anonymize(lf, maps), threshold)
             table = (
-                df.with_columns(embedding)
-                .drop(EMBED_TEXT_COL)
+                lf.join(emb_lazy, on=EMBED_TEXT_COL, how="left", maintain_order="left")
                 .select(OUTPUT_COLUMNS)
+                .collect()
                 .to_arrow()
             )
             if writer is None:
                 writer = pq.ParquetWriter(output, table.schema, compression="zstd")
             writer.write_table(table)
-            rows += len(df)
+            rows += table.num_rows
+            batches += 1
+            if batches % log_every == 0:
+                log(f"  wrote {rows} rows ({time.monotonic() - t0:.1f}s)")
     finally:
         if writer is not None:
             writer.close()

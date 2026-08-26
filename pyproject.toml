@@ -11,13 +11,14 @@ requires-python = ">=3.11"
 dependencies = [
     "polars>=1.30",
     "pyarrow>=17",
-    "sentence-transformers>=3.0",
+    "sentence-transformers>=3.2",
     "matplotlib>=3.8",
     "seaborn>=0.13",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+onnx = ["optimum[onnxruntime]>=1.20"]
 
 [project.scripts]
 fdata = "fdata.cli:main"
