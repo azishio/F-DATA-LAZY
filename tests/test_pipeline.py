@@ -10,9 +10,11 @@ sys.path.insert(0, str(Path(__file__).parent / "fixtures"))
 from make_fixture import EXPECTED_ROWS, write_fixture  # noqa: E402
 
 from fdata import cli  # noqa: E402
+from fdata.anonymize import hash_label  # noqa: E402
 from fdata.schema import EMBED_DIM, FINAL_COLUMNS, OUTPUT_COLUMNS, RIDGE_POINT  # noqa: E402
 
 TRAIN_RATIO = 0.8
+SALT = "test-salt"
 
 
 class DummyModel:
@@ -52,6 +54,7 @@ def generated(fixture_paths, tmp_path_factory) -> Path:
                 "--output", str(out),
                 "--train-ratio", str(TRAIN_RATIO),
                 "--batch-size", "512",
+                "--anon-salt", SALT,
             ]
         )
     finally:
@@ -83,13 +86,15 @@ def test_dirty_rows_dropped(df):
 
 
 def test_anonymization(df):
-    assert df["usr"][0] == "usr_0"
-    assert df["jid"][0] == "jid_0"
-    # jid is unique per row, so labels are dense 0..n-1 in row order
-    assert df["jid"].to_list()[:3] == ["jid_0", "jid_1", "jid_2"]
+    # Salted-hash labels: deterministic given the salt, opaque otherwise.
+    assert df["usr"][0] == hash_label("usr", "user01", SALT)  # fixture row 0
     non_null_usr = df["usr"].drop_nulls()
-    assert set(non_null_usr.to_list()) == {f"usr_{i}" for i in range(20)}
-    assert set(df["jobenv_req"].to_list()) <= {"jobenv_req_0", "jobenv_req_1", "jobenv_req_2"}
+    assert non_null_usr.n_unique() == 20
+    assert non_null_usr.str.contains(r"^usr_[0-9a-f]{16}$").all()
+    assert df["jid"].str.contains(r"^jid_[0-9a-f]{16}$").all()
+    assert df["jobenv_req"].n_unique() == 3
+    for c in ["jid_or", "usr_or", "jnam_or", "jobenv_req_or"]:
+        assert c not in df.columns
 
 
 def test_split_is_temporal(df):
@@ -134,23 +139,42 @@ def test_deduplicated_embeddings(df):
     assert firsts["e0"].min() > 0  # the null-usr row still embeds jnam+env
 
 
+def test_hash_label_determinism():
+    from fdata.anonymize import generate_salt
+
+    assert hash_label("usr", "x", "s") == hash_label("usr", "x", "s")
+    assert hash_label("usr", "x", "s") != hash_label("usr", "x", "t")
+    assert hash_label("usr", "x", "s") != hash_label("jnam", "x", "s")
+    assert generate_salt() != generate_salt()
+
+
 def test_final_columns_match_docs():
     docs = pl.read_csv(Path(__file__).parent.parent / "docs" / "feature_list.csv")
     assert FINAL_COLUMNS == docs["Column"].to_list()
 
 
-def test_parquet_input(fixture_paths, tmp_path):
+def test_parquet_input_and_cross_run_compatibility(fixture_paths, tmp_path, df):
     _, parquet_path = fixture_paths
     out = tmp_path / "fdata_from_parquet.parquet"
     mp = pytest.MonkeyPatch()
     _patch_model(mp)
     try:
-        cli.main(["generate", "--input", str(parquet_path), "--output", str(out)])
+        cli.main(
+            [
+                "generate",
+                "--input", str(parquet_path),
+                "--output", str(out),
+                "--anon-salt", SALT,
+            ]
+        )
     finally:
         mp.undo()
     df2 = pl.read_parquet(out)
     assert len(df2) == EXPECTED_ROWS
     assert df2.columns == OUTPUT_COLUMNS
+    # Same salt in a separate run -> identical labels, so outputs combine.
+    for c in ["usr", "jnam", "jobenv_req"]:
+        assert set(df2[c].to_list()) == set(df[c].to_list())
 
 
 def test_plot(generated, tmp_path):
