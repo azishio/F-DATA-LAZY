@@ -139,6 +139,32 @@ def test_deduplicated_embeddings(df):
     assert firsts["e0"].min() > 0  # the null-usr row still embeds jnam+env
 
 
+def test_load_model_resolves_local_dir(monkeypatch):
+    # FDATA_MODEL_DIR must yield a local path: loading by model ID queries
+    # the HF Hub even when cached, which breaks offline containers.
+    import sys
+    import types
+
+    calls = {}
+
+    class FakeST:
+        def __init__(self, source, device=None, backend=None):
+            calls["source"], calls["backend"] = source, backend
+
+    fake = types.ModuleType("sentence_transformers")
+    fake.SentenceTransformer = FakeST
+    monkeypatch.setitem(sys.modules, "sentence_transformers", fake)
+    from fdata.embedding import load_model
+    from fdata.schema import EMBED_MODEL
+
+    monkeypatch.setenv("FDATA_MODEL_DIR", "/opt/models")
+    load_model("onnx")
+    assert calls == {"source": "/opt/models/onnx", "backend": "onnx"}
+    monkeypatch.delenv("FDATA_MODEL_DIR")
+    load_model("torch")
+    assert calls == {"source": EMBED_MODEL, "backend": "torch"}
+
+
 def test_hash_label_determinism():
     from fdata.anonymize import generate_salt
 

@@ -11,6 +11,7 @@ independent of the row count.
 
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 
@@ -25,7 +26,13 @@ from .split import with_split
 def load_model(backend: str = "torch"):
     from sentence_transformers import SentenceTransformer
 
-    return SentenceTransformer(EMBED_MODEL, device="cpu", backend=backend)
+    # Loading by model ID queries the HF Hub (list_repo_files) to locate the
+    # backend file even when the model is cached, which breaks offline runs;
+    # a local directory is resolved entirely on disk. The container bakes
+    # the models as directories and sets FDATA_MODEL_DIR.
+    model_dir = os.environ.get("FDATA_MODEL_DIR")
+    source = str(Path(model_dir) / backend) if model_dir else EMBED_MODEL
+    return SentenceTransformer(source, device="cpu", backend=backend)
 
 
 def encode_unique(
