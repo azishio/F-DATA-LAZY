@@ -9,8 +9,11 @@ same schema as the published
 
 Built on [polars](https://pola.rs) lazy/streaming execution: the dataset is
 never fully loaded into memory. The only non-lazy stage — Sentence-BERT
-embedding inference — runs over bounded record batches, so memory use stays
-flat regardless of input size.
+embedding inference — encodes each **distinct** input text exactly once
+(the text depends only on `usr`/`jnam`/`jobenv_req`, so distinct texts are
+typically orders of magnitude fewer than rows) and runs over bounded
+chunks, so memory use stays flat regardless of input size. Progress (rows
+processed, elapsed time) is logged to stderr throughout.
 
 Based on F-DATA: *A Fugaku Workload Dataset for Job-centric Predictive
 Modelling in HPC Systems* (Antici et al., Scientific Data 12, 1321, 2025).
@@ -46,8 +49,9 @@ the container needs no network access at runtime.
 | `--output` | (required) | Output parquet path |
 | `--train-ratio` | `0.8` (or `FDATA_TRAIN_RATIO`) | Fraction of earliest-`adt` rows labeled `train` |
 | `--format` | inferred from extension | Force `csv` or `parquet` |
-| `--batch-size` | `8192` | Rows per embedding batch (memory knob) |
+| `--batch-size` | `8192` | Rows per encode chunk / final-write batch (memory knob) |
 | `--tmp-dir` | alongside the output | Where the phase-1 intermediate parquet lives |
+| `--encoder-backend` | `torch` (or `FDATA_ENCODER_BACKEND`) | `onnx` is ~2-3x faster on CPU (needs the `[onnx]` extra); the container image defaults to `onnx` |
 
 ### Input schema
 
@@ -59,22 +63,28 @@ Extra columns (`ermsg`, `fjprofiler`, ...) are ignored.
 
 ## What the pipeline does
 
-Reimplements `legacy/generation_scripts/` as four streaming passes:
+Reimplements `legacy/generation_scripts/` as four passes; the (possibly
+CSV) source is parsed exactly once, and every later pass reads the fast
+columnar intermediate instead:
 
-1. **Clean** — drop rows with null/empty/epoch (`1970-*`) `adt`/`sdt`/`edt`;
-   cast the numeric columns, dropping rows that fail; datetime columns stay
-   strings, exactly as in the published data.
-2. **Anonymize** — `jid`, `usr`, `jnam`, `jobenv_req` are replaced by
-   first-appearance sequential pseudonyms (`usr_0`, `usr_1`, ...), built as
-   small mapping tables in one streaming pass and applied via joins.
-3. **Derive + split** — `flops`, `mbwidth`, `opint`, `pclass`,
-   `exit state`, `duration` (roofline model constants of Fugaku), and the
-   `split` column: rows are ordered by `adt` and the earliest
-   `ceil(n * ratio)` become `train`, the rest `test` (ties at the threshold go
-   to `train`, so the realized train fraction is ≥ the ratio).
-4. **Embed** — `embedding` (384-dim Sentence-BERT over the comma-joined
-   original `usr`/`jnam`/`jobenv_req`), computed batch-by-batch while
-   streaming the final parquet to disk.
+1. **Clean + derive** (streaming) — drop rows with null/empty/epoch
+   (`1970-*`) `adt`/`sdt`/`edt`; cast the numeric columns, dropping rows
+   that fail (datetime columns stay strings, exactly as in the published
+   data); compute `flops`, `mbwidth`, `opint`, `pclass`, `exit state`,
+   `duration` (roofline model constants of Fugaku) and the embedding input
+   text; sink everything to an intermediate parquet.
+2. **Aggregate** (streaming, one shared pass) — first-appearance
+   anonymization maps for `jid`/`usr`/`jnam`/`jobenv_req` (`usr_0`,
+   `usr_1`, ...), the row count, the distinct embedding texts, and the
+   temporal split threshold: rows are ordered by `adt` and the earliest
+   `ceil(n * ratio)` become `train`, the rest `test` (ties at the
+   threshold go to `train`, so the realized train fraction is ≥ the ratio).
+3. **Encode** — each distinct text is embedded exactly once (384-dim
+   Sentence-BERT over the comma-joined original `usr`/`jnam`/`jobenv_req`),
+   with chunked progress logging; identical rows get bit-identical vectors.
+4. **Write** — the intermediate is streamed batch by batch, applying the
+   pseudonym maps, the `split` label, and the embedding lookup as joins,
+   into the final single parquet, logging rows written and elapsed time.
 
 `plot` reproduces the figures of `legacy/generate_plots.py` from the
 generated parquet — per-month exit-code/duration/power distributions under

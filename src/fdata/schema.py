@@ -42,8 +42,8 @@ DATE_COLS = ["adt", "qdt", "schedsdt", "deldt", "sdt", "edt"]
 RIDGE_POINT = 537_000_000 / 163_000_000
 
 # Sentence-BERT input: comma-joined non-empty original (pre-anonymization)
-# values of these columns.
-EMBED_SOURCE = ["usr_or", "jnam_or", "jobenv_req_or"]
+# values of these columns. Derived before anonymization, so original names.
+EMBED_SOURCE = ["usr", "jnam", "jobenv_req"]
 EMBED_MODEL = "all-MiniLM-L6-v2"
 EMBED_DIM = 384
 EMBED_TEXT_COL = "_embed_text"
@@ -73,6 +73,9 @@ OUTPUT_COLUMNS = FINAL_COLUMNS + [SPLIT_COL]
 _DERIVED = {"flops", "mbwidth", "opint", "pclass", "embedding", "exit state", "duration"}
 RAW_INPUT_COLUMNS = [c for c in FINAL_COLUMNS if c not in _DERIVED] + ["elp"]
 
-# Columns written by the phase-1 lazy sink (everything except the embedding,
-# which is computed in the batched phase 2).
-PHASE1_COLUMNS = [c for c in OUTPUT_COLUMNS if c != "embedding"] + [EMBED_TEXT_COL]
+# Columns written by the phase-1 lazy sink: every final column except
+# embedding and split (both applied in the final pass), with the anonymized
+# features still carrying their original values.
+INTERMEDIATE_COLUMNS = [
+    c for c in FINAL_COLUMNS if c != "embedding"
+] + [EMBED_TEXT_COL]

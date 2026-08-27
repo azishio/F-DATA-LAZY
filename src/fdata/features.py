@@ -25,9 +25,10 @@ def derive(lf: pl.LazyFrame) -> pl.LazyFrame:
         .otherwise(pl.lit("failed"))
         .alias("exit state"),
         pl.col("elp").alias("duration"),
-        # Comma-join of truthy source values; when() without otherwise()
-        # yields null for empty strings, which ignore_nulls skips — matching
-        # the original convert_to_str's falsy filter.
+        # Comma-join of truthy source values (pre-anonymization originals);
+        # when() without otherwise() yields null for empty strings, which
+        # ignore_nulls skips — matching the original convert_to_str's
+        # falsy filter.
         pl.concat_str(
             [pl.when(pl.col(c) != "").then(pl.col(c)) for c in EMBED_SOURCE],
             separator=",",

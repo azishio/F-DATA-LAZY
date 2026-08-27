@@ -10,13 +10,13 @@ from pathlib import Path
 
 import polars as pl
 
-from .anonymize import anonymize, build_maps
+from .anonymize import build_maps
 from .cleaning import clean
-from .embedding import add_embeddings
+from .embedding import encode_unique, load_model, write_final
 from .features import derive
 from .io import scan_input
-from .schema import PHASE1_COLUMNS
-from .split import compute_threshold, with_split
+from .schema import EMBED_TEXT_COL, INTERMEDIATE_COLUMNS
+from .split import compute_threshold
 
 
 def _log(msg: str) -> None:
@@ -33,25 +33,58 @@ def cmd_generate(args: argparse.Namespace) -> None:
     intermediate = tmp_dir / f".{output.stem}.phase1.parquet"
 
     t0 = time.monotonic()
-    lf = clean(scan_input(Path(args.input), args.format))
-
-    _log("building anonymization maps (streaming pass A)")
-    maps = build_maps(lf)
-    for feat, mapping in maps.items():
-        _log(f"  {feat}: {len(mapping)} unique values")
-    lf = derive(anonymize(lf, maps))
-
-    _log(f"computing train/test threshold at ratio {args.train_ratio} (pass B)")
-    threshold = compute_threshold(lf, args.train_ratio)
-    _log(f"  train = adt <= {threshold!r}")
-    lf = with_split(lf, threshold)
-
-    _log(f"sinking cleaned data to {intermediate} (streaming pass C)")
     try:
-        lf.select(PHASE1_COLUMNS).sink_parquet(intermediate, row_group_size=64_000)
+        # Pass 1: the only read of the (possibly CSV) source — clean, derive,
+        # and sink to an intermediate parquet all later passes read instead.
+        _log("cleaning and deriving features (streaming pass 1)")
+        lf = derive(clean(scan_input(Path(args.input), args.format)))
+        lf.select(INTERMEDIATE_COLUMNS).sink_parquet(
+            intermediate, row_group_size=64_000
+        )
+        _log(f"  sunk intermediate parquet ({time.monotonic() - t0:.1f}s)")
 
-        _log("computing embeddings and writing final parquet (pass D)")
-        rows = add_embeddings(intermediate, output, batch_size=args.batch_size)
+        # Pass 2: one shared collect_all over the intermediate for the
+        # anonymization maps, the row count, and the distinct embedding
+        # texts; plus a single-column scan for the split threshold.
+        lf_i = pl.scan_parquet(intermediate)
+        _log("collecting anonymization maps, row count, unique texts (pass 2)")
+        maps = build_maps(lf_i)
+        for feat, mapping in maps.items():
+            _log(f"  {feat}: {len(mapping)} unique values")
+        n_rows, texts_df = pl.collect_all(
+            [
+                lf_i.select(pl.len()),
+                lf_i.select(pl.col(EMBED_TEXT_COL).fill_null("")).unique(),
+            ],
+            engine="streaming",
+        )
+        n = n_rows.item()
+        texts = texts_df.to_series().to_list()
+        threshold = compute_threshold(lf_i, args.train_ratio, n)
+        _log(f"  {n} rows, {len(texts)} unique embedding texts")
+        _log(f"  train = adt <= {threshold!r} (ratio {args.train_ratio})")
+
+        # Pass 3: encode each distinct text exactly once.
+        _log(f"encoding unique texts with the {args.encoder_backend} backend (pass 3)")
+        embeddings = encode_unique(
+            texts,
+            load_model(args.encoder_backend),
+            chunk_size=args.batch_size,
+            log=_log,
+        )
+
+        # Pass 4: stream the intermediate, applying anonymization, split,
+        # and the embedding lookup per batch.
+        _log("writing final parquet (pass 4)")
+        rows = write_final(
+            intermediate,
+            output,
+            maps,
+            threshold,
+            embeddings,
+            batch_size=args.batch_size,
+            log=_log,
+        )
     finally:
         intermediate.unlink(missing_ok=True)
 
@@ -86,7 +119,16 @@ def main(argv: list[str] | None = None) -> None:
     gen.add_argument("--format", choices=["csv", "parquet"], default=None,
                      help="input format (default: inferred from extension)")
     gen.add_argument("--batch-size", type=int, default=8192,
-                     help="rows per embedding batch (default 8192)")
+                     help="rows per encode chunk and final-write batch "
+                     "(default 8192)")
+    gen.add_argument(
+        "--encoder-backend",
+        choices=["torch", "onnx"],
+        default=os.environ.get("FDATA_ENCODER_BACKEND", "torch"),
+        help="sentence-transformers inference backend (default torch, "
+        "env FDATA_ENCODER_BACKEND; onnx is ~2-3x faster on CPU and "
+        "requires the [onnx] extra)",
+    )
     gen.add_argument("--tmp-dir", default=None,
                      help="directory for the phase-1 intermediate "
                      "(default: alongside the output)")

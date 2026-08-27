@@ -15,9 +15,12 @@ import polars as pl
 from .schema import SPLIT_COL
 
 
-def compute_threshold(lf: pl.LazyFrame, ratio: float) -> str | None:
-    """Return the adt value below which rows are train, or None for k == 0."""
-    n = lf.select(pl.len()).collect(engine="streaming").item()
+def compute_threshold(lf: pl.LazyFrame, ratio: float, n: int) -> str | None:
+    """Return the adt value below which rows are train, or None for k == 0.
+
+    `n` is the row count of `lf`, supplied by the caller so it can be
+    computed alongside other aggregations in a shared collect_all pass.
+    """
     if n == 0:
         raise ValueError("No rows survived cleaning; nothing to split")
     k = min(math.ceil(n * ratio), n)
