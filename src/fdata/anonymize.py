@@ -1,40 +1,69 @@
-"""First-appearance sequential anonymization ("usr_0", "usr_1", ...).
+"""Anonymization of jid/usr/jnam/jobenv_req via salted-hash labels.
 
-The original script accumulated a value -> "{feat}_{n}" dict in row order
-across the monthly files. With a single input, first appearance = minimum
-row index; the mapping tables (unique users/job names) are tiny compared to
-the data, so we build them in one streaming pass and apply them via small
-in-memory left joins.
+Labels are keyed hashes: `usr_<16 hex chars of HMAC-SHA256(salt, value)>`.
+Deterministic given the salt, so outputs of separate runs sharing a salt can
+be combined (same original -> same label, and 64-bit truncation makes
+cross-value collisions negligible). The salt is what prevents dictionary
+attacks on low-entropy identifiers — an unsalted hash of a guessable
+username is trivially reversible — so it must be kept secret and reused
+across runs that need to interoperate.
 
-Divergences from the original, both documented in the README:
-- the original built its maps before the numeric row-drops, so values that
-  only occur in later-dropped rows still consumed a pseudonym number; we map
-  the cleaned data, which yields an equivalent (denser) bijection.
-- the original also mapped NaN to a pseudonym; we keep nulls null.
+The mapping tables (unique users/job names) are tiny compared to the data:
+one streaming pass collects the distinct values and the labels are applied
+via small in-memory left joins.
+
+Divergences from the original scripts (documented in the README): the
+published F-DATA uses first-appearance sequential numbering ("usr_0",
+"usr_1", ...) instead of hashes, and mapped NaN to a pseudonym where we
+keep nulls null.
 """
 
 from __future__ import annotations
+
+import hashlib
+import hmac
+import os
+from datetime import datetime, timezone
 
 import polars as pl
 
 from .schema import ANON_FEATURES
 
+HASH_LABEL_HEX_CHARS = 16
 
-def build_maps(lf: pl.LazyFrame) -> dict[str, pl.DataFrame]:
-    lf_idx = lf.with_row_index("_ridx")
+
+def generate_salt() -> str:
+    """Auto-salt for runs that don't pass one: current time plus random
+    bits (time alone would be guessable enough to enable dictionary
+    attacks). Logged by the CLI so later runs can reuse it."""
+    now = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+    return f"{now}-{os.urandom(8).hex()}"
+
+
+def hash_label(feat: str, value: str, salt: str) -> str:
+    digest = hmac.new(
+        salt.encode(), f"{feat}:{value}".encode(), hashlib.sha256
+    ).hexdigest()
+    return f"{feat}_{digest[:HASH_LABEL_HEX_CHARS]}"
+
+
+def build_maps(lf: pl.LazyFrame, salt: str) -> dict[str, pl.DataFrame]:
+    if not salt:
+        raise ValueError("anonymization requires a salt")
     plans = [
-        lf_idx.filter(pl.col(feat).is_not_null())
-        .group_by(feat)
-        .agg(pl.col("_ridx").min())
-        .sort("_ridx")
-        .with_row_index("_rank")
-        .select(
-            pl.col(feat).alias(f"{feat}_or"),
-            pl.format("{}_{}", pl.lit(feat), pl.col("_rank")).alias(feat),
-        )
-        for feat in ANON_FEATURES
+        lf.select(pl.col(feat).drop_nulls()).unique() for feat in ANON_FEATURES
     ]
-    return dict(zip(ANON_FEATURES, pl.collect_all(plans, engine="streaming")))
+    uniques = pl.collect_all(plans, engine="streaming")
+    maps = {}
+    for feat, frame in zip(ANON_FEATURES, uniques):
+        values = frame.to_series().to_list()
+        maps[feat] = pl.DataFrame(
+            {
+                f"{feat}_or": pl.Series(values, dtype=pl.Utf8),
+                feat: [hash_label(feat, v, salt) for v in values],
+            }
+        )
+    return maps
 
 
 def anonymize(lf: pl.LazyFrame, maps: dict[str, pl.DataFrame]) -> pl.LazyFrame:

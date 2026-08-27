@@ -51,6 +51,7 @@ the container needs no network access at runtime.
 | `--format` | inferred from extension | Force `csv` or `parquet` |
 | `--batch-size` | `8192` | Rows per encode chunk / final-write batch (memory knob) |
 | `--tmp-dir` | alongside the output | Where the phase-1 intermediate parquet lives |
+| `--anon-salt` | auto-generated + logged (or `FDATA_ANON_SALT`) | Secret salt for the anonymization hashes; reuse one salt across runs whose outputs must be combinable. Prefer the env var (command lines leak via process listings) |
 | `--encoder-backend` | `torch` (or `FDATA_ENCODER_BACKEND`) | `onnx` is ~2-3x faster on CPU (needs the `[onnx]` extra); the container image defaults to `onnx` |
 
 ### Input schema
@@ -73,12 +74,17 @@ columnar intermediate instead:
    data); compute `flops`, `mbwidth`, `opint`, `pclass`, `exit state`,
    `duration` (roofline model constants of Fugaku) and the embedding input
    text; sink everything to an intermediate parquet.
-2. **Aggregate** (streaming, one shared pass) — first-appearance
-   anonymization maps for `jid`/`usr`/`jnam`/`jobenv_req` (`usr_0`,
-   `usr_1`, ...), the row count, the distinct embedding texts, and the
-   temporal split threshold: rows are ordered by `adt` and the earliest
-   `ceil(n * ratio)` become `train`, the rest `test` (ties at the
-   threshold go to `train`, so the realized train fraction is ≥ the ratio).
+2. **Aggregate** (streaming, one shared pass) — anonymization maps for
+   `jid`/`usr`/`jnam`/`jobenv_req`, the row count, the distinct embedding
+   texts, and the temporal split threshold: rows are ordered by `adt` and
+   the earliest `ceil(n * ratio)` become `train`, the rest `test` (ties at
+   the threshold go to `train`, so the realized train fraction is ≥ the
+   ratio). Anonymization labels are salted hashes
+   (`usr_<16 hex of HMAC-SHA256(salt, value)>`): runs sharing a salt
+   produce identical labels, so their outputs can be combined, while the
+   secret salt prevents dictionary attacks on guessable identifiers. When
+   no salt is given one is generated (current time + random bits) and
+   logged for reuse.
 3. **Encode** — each distinct text is embedded exactly once (384-dim
    Sentence-BERT over the comma-joined original `usr`/`jnam`/`jobenv_req`),
    with chunked progress logging; identical rows get bit-identical vectors.
@@ -95,8 +101,11 @@ aggregation done in one streaming polars pass and months derived from `adt`.
 
 - The original crashed on non-numeric strings in numeric columns; this
   pipeline drops those rows instead.
-- Pseudonym numbering starts after cleaning, so values occurring only in
-  dropped rows don't consume a number (labels are opaque either way).
+- Anonymization labels are salted hashes (`usr_9f3a...`) instead of the
+  published first-appearance numbering (`usr_0`, `usr_1`, ...): sequential
+  labels depend on row order, so separately processed datasets could not
+  be combined (the same value gets different labels, and different values
+  collide on labels like `usr_0`).
 - A null anonymized value stays null instead of receiving a pseudonym.
 - Duration histograms use 50 fixed bins instead of seaborn's automatic
   binning.
