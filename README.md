@@ -38,8 +38,13 @@ docker run --rm -e FDATA_TRAIN_RATIO=0.9 -v "$PWD/data:/data" \
   generate --input /data/raw.parquet --output /data/fdata.parquet
 ```
 
-The sentence-transformers model (`all-MiniLM-L6-v2`) is baked into the image;
-the container needs no network access at runtime.
+The sentence-transformers model (`all-MiniLM-L6-v2`) is baked into the image
+as local model directories (`/opt/models/{torch,onnx}`, selected via
+`FDATA_MODEL_DIR`); the container needs no network access at runtime. Note
+that an HF cache alone would not be enough: sentence-transformers queries
+the HF Hub to locate the backend file when given a model ID, even when the
+model is cached — only local-directory loading is fully offline, and the
+image build verifies this with an offline load check.
 
 ### `generate` options
 
