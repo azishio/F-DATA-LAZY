@@ -82,18 +82,17 @@ def cmd_generate(args: argparse.Namespace) -> None:
             log=_log,
         )
 
-        # Pass 4: stream the intermediate, applying anonymization, split,
-        # and the embedding lookup per batch.
-        _log("writing final parquet (pass 4)")
-        rows = write_final(
+        # Pass 4: apply anonymization, split, and embedding lookup, then
+        # stream one adt-sorted parquet from Polars.
+        _log("writing adt-sorted final parquet (pass 4)")
+        write_final(
             intermediate,
             output,
             maps,
             threshold,
             embeddings,
-            batch_size=args.batch_size,
-            log=_log,
         )
+        rows = n
     finally:
         intermediate.unlink(missing_ok=True)
 
@@ -128,8 +127,7 @@ def main(argv: list[str] | None = None) -> None:
     gen.add_argument("--format", choices=["csv", "parquet"], default=None,
                      help="input format (default: inferred from extension)")
     gen.add_argument("--batch-size", type=int, default=8192,
-                     help="rows per encode chunk and final-write batch "
-                     "(default 8192)")
+                     help="unique texts per embedding chunk (default 8192)")
     gen.add_argument(
         "--anon-salt",
         default=os.environ.get("FDATA_ANON_SALT"),

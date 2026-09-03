@@ -1,12 +1,11 @@
 """Anonymization of jid/usr/jnam/jobenv_req via salted-hash labels.
 
-Labels are keyed hashes: `usr_<16 hex chars of HMAC-SHA256(salt, value)>`.
+Labels are keyed hashes: `usr_<64 hex chars of HMAC-SHA256(salt, value)>`.
 Deterministic given the salt, so outputs of separate runs sharing a salt can
-be combined (same original -> same label, and 64-bit truncation makes
-cross-value collisions negligible). The salt is what prevents dictionary
-attacks on low-entropy identifiers — an unsalted hash of a guessable
-username is trivially reversible — so it must be kept secret and reused
-across runs that need to interoperate.
+be combined (same original -> same label). The salt is what prevents
+dictionary attacks on low-entropy identifiers — an unsalted hash of a
+guessable username is trivially reversible — so it must be kept secret and
+reused across runs that need to interoperate.
 
 The mapping tables (unique users/job names) are tiny compared to the data:
 one streaming pass collects the distinct values and the labels are applied
@@ -29,8 +28,6 @@ import polars as pl
 
 from .schema import ANON_FEATURES
 
-HASH_LABEL_HEX_CHARS = 16
-
 
 def generate_salt() -> str:
     """Auto-salt for runs that don't pass one: current time plus random
@@ -44,7 +41,7 @@ def hash_label(feat: str, value: str, salt: str) -> str:
     digest = hmac.new(
         salt.encode(), f"{feat}:{value}".encode(), hashlib.sha256
     ).hexdigest()
-    return f"{feat}_{digest[:HASH_LABEL_HEX_CHARS]}"
+    return f"{feat}_{digest}"
 
 
 def build_maps(lf: pl.LazyFrame, salt: str) -> dict[str, pl.DataFrame]:
@@ -57,12 +54,19 @@ def build_maps(lf: pl.LazyFrame, salt: str) -> dict[str, pl.DataFrame]:
     maps = {}
     for feat, frame in zip(ANON_FEATURES, uniques):
         values = frame.to_series().to_list()
-        maps[feat] = pl.DataFrame(
+        mapping = pl.DataFrame(
             {
                 f"{feat}_or": pl.Series(values, dtype=pl.Utf8),
                 feat: [hash_label(feat, v, salt) for v in values],
             }
         )
+        anonymized_count = mapping[feat].n_unique()
+        if anonymized_count != len(values):
+            raise RuntimeError(
+                f"Anonymization collision in {feat}: {len(values)} unique "
+                f"values before, {anonymized_count} after"
+            )
+        maps[feat] = mapping
     return maps
 
 

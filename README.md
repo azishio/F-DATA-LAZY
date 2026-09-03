@@ -54,7 +54,7 @@ image build verifies this with an offline load check.
 | `--output` | (required) | Output parquet path |
 | `--train-ratio` | `0.8` (or `FDATA_TRAIN_RATIO`) | Fraction of earliest-`adt` rows labeled `train` |
 | `--format` | inferred from extension | Force `csv` or `parquet` |
-| `--batch-size` | `8192` | Rows per encode chunk / final-write batch (memory knob) |
+| `--batch-size` | `8192` | Unique texts per embedding chunk |
 | `--tmp-dir` | alongside the output | Where the phase-1 intermediate parquet lives |
 | `--anon-salt` | auto-generated + logged (or `FDATA_ANON_SALT`) | Secret salt for the anonymization hashes; reuse one salt across runs whose outputs must be combinable. Prefer the env var (command lines leak via process listings) |
 | `--encoder-backend` | `torch` (or `FDATA_ENCODER_BACKEND`) | `onnx` is ~2-3x faster on CPU (needs the `[onnx]` extra); the container image defaults to `onnx` |
@@ -85,17 +85,19 @@ columnar intermediate instead:
    the earliest `ceil(n * ratio)` become `train`, the rest `test` (ties at
    the threshold go to `train`, so the realized train fraction is ≥ the
    ratio). Anonymization labels are salted hashes
-   (`usr_<16 hex of HMAC-SHA256(salt, value)>`): runs sharing a salt
+   (`usr_<64 hex of HMAC-SHA256(salt, value)>`): runs sharing a salt
    produce identical labels, so their outputs can be combined, while the
-   secret salt prevents dictionary attacks on guessable identifiers. When
-   no salt is given one is generated (current time + random bits) and
+   secret salt prevents dictionary attacks on guessable identifiers. The
+   pipeline verifies that each anonymized column has the same number of
+   unique values before and after anonymization, aborting on a collision.
+   When no salt is given one is generated (current time + random bits) and
    logged for reuse.
 3. **Encode** — each distinct text is embedded exactly once (384-dim
    Sentence-BERT over the comma-joined original `usr`/`jnam`/`jobenv_req`),
    with chunked progress logging; identical rows get bit-identical vectors.
-4. **Write** — the intermediate is streamed batch by batch, applying the
-   pseudonym maps, the `split` label, and the embedding lookup as joins,
-   into the final single parquet, logging rows written and elapsed time.
+4. **Write** — Polars lazily applies the pseudonym maps, the `split` label,
+   and the embedding lookup, sorts by `adt`, then streams a single Zstd
+   parquet with standard row-group statistics (`min`, `max`, `null_count`).
 
 `plot` reproduces the figures of `legacy/generate_plots.py` from the
 generated parquet — per-month exit-code/duration/power distributions under

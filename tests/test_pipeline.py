@@ -3,6 +3,7 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
+import pyarrow.parquet as pq
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent / "fixtures"))
@@ -90,20 +91,49 @@ def test_anonymization(df):
     assert df["usr"][0] == hash_label("usr", "user01", SALT)  # fixture row 0
     non_null_usr = df["usr"].drop_nulls()
     assert non_null_usr.n_unique() == 20
-    assert non_null_usr.str.contains(r"^usr_[0-9a-f]{16}$").all()
-    assert df["jid"].str.contains(r"^jid_[0-9a-f]{16}$").all()
+    assert non_null_usr.str.contains(r"^usr_[0-9a-f]{64}$").all()
+    assert df["jid"].str.contains(r"^jid_[0-9a-f]{64}$").all()
     assert df["jobenv_req"].n_unique() == 3
     for c in ["jid_or", "usr_or", "jnam_or", "jobenv_req_or"]:
         assert c not in df.columns
 
 
 def test_split_is_temporal(df):
+    assert df["adt"].is_sorted()
     train = df.filter(pl.col("split") == "train")
     test = df.filter(pl.col("split") == "test")
     assert len(train) + len(test) == len(df)
     assert train["adt"].max() <= test["adt"].min()
     realized = len(train) / len(df)
     assert TRAIN_RATIO <= realized < TRAIN_RATIO + 0.01
+
+
+def test_parquet_has_column_statistics(generated, df):
+    parquet = pq.ParquetFile(generated)
+    metadata = parquet.metadata
+    columns = [
+        metadata.row_group(row_group).column(column)
+        for row_group in range(metadata.num_row_groups)
+        for column in range(metadata.row_group(row_group).num_columns)
+    ]
+    assert all(
+        column.statistics is not None and column.statistics.has_min_max
+        for column in columns
+    )
+
+    adt_index = next(
+        i
+        for i in range(metadata.row_group(0).num_columns)
+        if metadata.row_group(0).column(i).path_in_schema == "adt"
+    )
+    stats = [
+        metadata.row_group(i).column(adt_index).statistics
+        for i in range(metadata.num_row_groups)
+    ]
+    assert all(stat is not None and stat.has_min_max for stat in stats)
+    assert min(stat.min for stat in stats) == df["adt"].min()
+    assert max(stat.max for stat in stats) == df["adt"].max()
+    assert sum(stat.null_count for stat in stats) == df["adt"].null_count()
 
 
 def test_derived_features(df):
@@ -174,6 +204,18 @@ def test_hash_label_determinism():
     assert generate_salt() != generate_salt()
 
 
+def test_anonymization_rejects_collisions(monkeypatch):
+    from fdata.anonymize import build_maps
+    from fdata.schema import ANON_FEATURES
+
+    lf = pl.DataFrame({feat: ["a", "b"] for feat in ANON_FEATURES}).lazy()
+    monkeypatch.setattr(
+        "fdata.anonymize.hash_label", lambda feat, value, salt: f"{feat}_same"
+    )
+    with pytest.raises(RuntimeError, match="2 unique values before, 1 after"):
+        build_maps(lf, SALT)
+
+
 def test_final_columns_match_docs():
     docs = pl.read_csv(Path(__file__).parent.parent / "docs" / "feature_list.csv")
     assert FINAL_COLUMNS == docs["Column"].to_list()
@@ -181,6 +223,8 @@ def test_final_columns_match_docs():
 
 def test_parquet_input_and_cross_run_compatibility(fixture_paths, tmp_path, df):
     _, parquet_path = fixture_paths
+    reversed_path = tmp_path / "raw_reversed.parquet"
+    pl.read_parquet(parquet_path).reverse().write_parquet(reversed_path)
     out = tmp_path / "fdata_from_parquet.parquet"
     mp = pytest.MonkeyPatch()
     _patch_model(mp)
@@ -188,7 +232,7 @@ def test_parquet_input_and_cross_run_compatibility(fixture_paths, tmp_path, df):
         cli.main(
             [
                 "generate",
-                "--input", str(parquet_path),
+                "--input", str(reversed_path),
                 "--output", str(out),
                 "--anon-salt", SALT,
             ]
@@ -198,6 +242,7 @@ def test_parquet_input_and_cross_run_compatibility(fixture_paths, tmp_path, df):
     df2 = pl.read_parquet(out)
     assert len(df2) == EXPECTED_ROWS
     assert df2.columns == OUTPUT_COLUMNS
+    assert df2["adt"].is_sorted()
     # Same salt in a separate run -> identical labels, so outputs combine.
     for c in ["usr", "jnam", "jobenv_req"]:
         assert set(df2[c].to_list()) == set(df[c].to_list())

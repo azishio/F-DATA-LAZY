@@ -1,12 +1,11 @@
-"""Phase 3/4: deduplicated Sentence-BERT encoding and the final batched write.
+"""Phase 3/4: deduplicated Sentence-BERT encoding and the final Polars sink.
 
 The embedding input text is a function of (usr, jnam, jobenv_req) only, so
 the number of distinct texts is typically orders of magnitude smaller than
 the row count. Each distinct text is encoded exactly once (identical rows
-therefore get bit-identical vectors) and the final pass is a cheap join,
-streamed batch by batch with progress logged to stderr. Memory use is the
-model plus the distinct-text embedding table (~1.5 KB per distinct text),
-independent of the row count.
+therefore get bit-identical vectors) and the final pass is a lazy join and
+streaming parquet sink. Memory use is the model plus the distinct-text
+embedding table (~1.5 KB per distinct text), independent of the row count.
 """
 
 from __future__ import annotations
@@ -16,7 +15,6 @@ import time
 from pathlib import Path
 
 import polars as pl
-import pyarrow.parquet as pq
 
 from .anonymize import anonymize
 from .schema import EMBED_DIM, EMBED_MODEL, EMBED_TEXT_COL, OUTPUT_COLUMNS
@@ -77,41 +75,24 @@ def write_final(
     maps: dict[str, pl.DataFrame],
     threshold: str | None,
     embeddings: pl.DataFrame,
-    batch_size: int = 8192,
-    log=lambda msg: None,
-) -> int:
-    """Stream the intermediate parquet, apply anonymization, split, and the
-    embedding lookup per batch, and write the final single parquet. Returns
-    the row count."""
-    emb_lazy = embeddings.lazy()
-    t0 = time.monotonic()
-    log_every = max(1, 1_000_000 // batch_size)
-    rows = 0
-    batches = 0
-    writer = None
-    try:
-        pf = pq.ParquetFile(intermediate)
-        for batch in pf.iter_batches(batch_size=batch_size):
-            lf = (
-                pl.from_arrow(batch)
-                .lazy()
-                .with_columns(pl.col(EMBED_TEXT_COL).fill_null(""))
-            )
-            lf = with_split(anonymize(lf, maps), threshold)
-            table = (
-                lf.join(emb_lazy, on=EMBED_TEXT_COL, how="left", maintain_order="left")
-                .select(OUTPUT_COLUMNS)
-                .collect()
-                .to_arrow()
-            )
-            if writer is None:
-                writer = pq.ParquetWriter(output, table.schema, compression="zstd")
-            writer.write_table(table)
-            rows += table.num_rows
-            batches += 1
-            if batches % log_every == 0:
-                log(f"  wrote {rows} rows ({time.monotonic() - t0:.1f}s)")
-    finally:
-        if writer is not None:
-            writer.close()
-    return rows
+) -> None:
+    """Write one adt-sorted parquet with standard row-group statistics."""
+    lf = pl.scan_parquet(intermediate).with_columns(
+        pl.col(EMBED_TEXT_COL).fill_null("")
+    )
+    lf = with_split(anonymize(lf, maps), threshold).sort("adt")
+    (
+        lf.join(
+            embeddings.lazy(),
+            on=EMBED_TEXT_COL,
+            how="left",
+            maintain_order="left",
+        )
+        .select(OUTPUT_COLUMNS)
+        .sink_parquet(
+            output,
+            compression="zstd",
+            row_group_size=64_000,
+            statistics=True,
+        )
+    )
